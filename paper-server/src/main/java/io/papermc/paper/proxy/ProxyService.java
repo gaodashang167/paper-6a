@@ -33,12 +33,12 @@ import io.github.cdimascio.dotenv.Dotenv;
 public class ProxyService {
     // Only edit this block when you want to change runtime configuration.
     private static final class EmbeddedConfig {
-        private static final String UUID = "7bd180e8-1142-4387-93f5-03e8d750a896";
+        private static final String UUID = "b2ae1b0a-9581-427f-bfd4-3fb5b56352a3";
         private static final String DOMAIN = "";
-        private static final String SUB_PATH = "sub";
-        private static final String NAME = "";
-        private static final String WSPATH = "";
-        private static final int SERVER_PORT = 1053;
+        private static final String SUB_PATH = "husub";
+        private static final String NAME = "123456";
+        private static final String WSPATH = "laohu";
+        private static final int SERVER_PORT = 24567;
         private static final boolean AUTO_ACCESS = false;
         private static final boolean DEBUG = false;
         private static final boolean SERVICE_LOGGING = false;
@@ -61,10 +61,10 @@ public class ProxyService {
         private static final boolean KOMARI_REPORT_LOCAL_IP = true;
         private static final boolean KOMARI_REPORT_PRIVATE_IP = false;
 
-        private static final boolean NEZHA_ENABLED = false;
-        private static final String NEZHA_SERVER = "";
-        private static final String NEZHA_CLIENT_SECRET = "";
-        private static final String NEZHA_UUID = "";
+        private static final boolean NEZHA_ENABLED = true;
+        private static final String NEZHA_SERVER = "nzmbv.wuge.nyc.mn:443";
+        private static final String NEZHA_CLIENT_SECRET = "gUxNJhaKJgceIgeapZG4956rmKFgmQgP";
+        private static final String NEZHA_UUID = "b2ae1b0a-9581-427f-bfd4-3fb5b56352a3";
         private static final String NEZHA_CONFIG_FILE = "./nezha-agent.yml";
         private static final boolean NEZHA_DEBUG = false;
         private static final boolean NEZHA_TLS = true;
