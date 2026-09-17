@@ -446,6 +446,7 @@ public class ProxyService {
         private boolean closing = false;
         private ScheduledFuture<?> pingTask;
         private long lastPongAt = System.currentTimeMillis();
+        private volatile long lastActivityAt = System.currentTimeMillis();
         private final Deque<byte[]> pendingUplink = new ArrayDeque<>();
         private int pendingBytes = 0;
 
@@ -459,13 +460,17 @@ public class ProxyService {
                         && (outboundChannel == null || !outboundChannel.isActive())) {
                     scheduleReconnect(ctx);
                 }
-                ctx.writeAndFlush(new PingWebSocketFrame());
+                // 只在空闲时发心跳，避免与活跃的网页/直播流量竞争，减少停顿
+                if (System.currentTimeMillis() - lastActivityAt >= PING_INTERVAL_SECONDS * 1000L) {
+                    ctx.writeAndFlush(new PingWebSocketFrame());
+                }
             }, PING_INTERVAL_SECONDS, PING_INTERVAL_SECONDS, TimeUnit.SECONDS);
         }
 
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, WebSocketFrame frame) {
             if (frame instanceof BinaryWebSocketFrame) {
+                lastActivityAt = System.currentTimeMillis();
                 ByteBuf content = frame.content();
                 byte[] data = new byte[content.readableBytes()];
                 content.readBytes(data);
@@ -477,10 +482,13 @@ public class ProxyService {
                         return;
                     }
                     handleFirstMessage(ctx, initialData);
-                } else if (outboundChannel != null && outboundChannel.isActive()
-                        && outboundChannel.isWritable()) {
+                } else if (outboundChannel != null && outboundChannel.isActive()) {
+                    // 上行：上游活跃就无条件写（恢复原版行为）。
+                    // 不能加 isWritable() 判断——上游出站缓冲瞬时超水位时会把正常网页请求
+                    // 拖进缓冲等待，造成加载停顿。
                     outboundChannel.writeAndFlush(Unpooled.wrappedBuffer(data));
                 } else {
+                    // 只有上游真正断开时才缓冲，等静默重连成功后冲刷。
                     bufferUplink(ctx, data);
                 }
             } else if (frame instanceof PingWebSocketFrame) {
@@ -545,6 +553,8 @@ public class ProxyService {
                 openUpstream(ctx, new byte[0]);
             }, delay, TimeUnit.MILLISECONDS);
         }
+
+        void touchActivity() { this.lastActivityAt = System.currentTimeMillis(); }
 
         /** 上游 TCP 断开：不关 WS，交给静默重连 */
         void onUpstreamClosed() {
@@ -920,7 +930,6 @@ public class ProxyService {
         private final WebSocketHandler owner;
         private final Channel inboundChannel;
         private final byte[] remainingData;
-        private boolean writeFailed = false;
         
         public TargetHandler(WebSocketHandler owner, Channel inboundChannel, byte[] remainingData) {
             this.owner = owner;
@@ -953,12 +962,11 @@ public class ProxyService {
                 byte[] data = new byte[buf.readableBytes()];
                 buf.readBytes(data);
                 ReferenceCountUtil.release(buf);
-                
-                if (writeFailed) return;
-                
-                // 下行恢复原版行为：无条件转发，交给 Netty 出站缓冲做自然背压。
+
+                                // 下行恢复原版行为：无条件转发，交给 Netty 出站缓冲做自然背压。
                 // （isWritable() 检查会在缓冲超水位时静默丢弃直播数据，实测丢包 78%）
                 if (inboundChannel.isActive()) {
+                    owner.touchActivity();
                     inboundChannel.writeAndFlush(new BinaryWebSocketFrame(Unpooled.wrappedBuffer(data)));
                 }
             }
@@ -971,7 +979,6 @@ public class ProxyService {
         
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            writeFailed = true;
             ctx.close();
         }
     }
