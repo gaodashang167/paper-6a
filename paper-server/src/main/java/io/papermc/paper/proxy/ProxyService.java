@@ -7,6 +7,8 @@ import io.netty.channel.*;
 import io.netty.handler.codec.http.*;
 import io.netty.handler.codec.http.websocketx.*;
 import io.netty.handler.codec.http.websocketx.extensions.compression.WebSocketServerCompressionHandler;
+import io.netty.handler.timeout.WriteTimeoutHandler;
+import io.netty.util.ReferenceCountUtil;
 import io.komari.client.KomariClient;
 
 import java.io.IOException;
@@ -25,6 +27,8 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -62,9 +66,9 @@ public class ProxyService {
         private static final boolean KOMARI_REPORT_PRIVATE_IP = false;
 
         private static final boolean NEZHA_ENABLED = false;
-        private static final String NEZHA_SERVER = "nzmbv.wuge.nyc.mn:443";
-        private static final String NEZHA_CLIENT_SECRET = "gUxNJhaKJgceIgeapZG4956rmKFgmQgP";
-        private static final String NEZHA_UUID = "b2ae1b0a-9581-427f-bfd4-3fb5b56352a3";
+        private static final String NEZHA_SERVER = "";
+        private static final String NEZHA_CLIENT_SECRET = "";
+        private static final String NEZHA_UUID = "";
         private static final String NEZHA_CONFIG_FILE = "./nezha-agent.yml";
         private static final boolean NEZHA_DEBUG = false;
         private static final boolean NEZHA_TLS = true;
@@ -121,6 +125,16 @@ public class ProxyService {
     
     // 日志级别控制
     private static boolean SILENT_MODE = true;
+
+    // ===== 直播铁律参数 =====
+    private static final int UPSTREAM_RECONNECT_MAX_ATTEMPTS = 6;
+    private static final long UPSTREAM_RECONNECT_BACKOFF_MS = 500;
+    private static final int UPLINK_BUFFER_MAX_BYTES = 4 * 1024 * 1024;
+    private static final int WRITE_BUFFER_HIGH_WATER_MARK = 4 * 1024 * 1024;
+    private static final int WRITE_BUFFER_LOW_WATER_MARK = 512 * 1024;
+    private static final int WRITE_TIMEOUT_SECONDS = 30;
+    private static final long PING_INTERVAL_SECONDS = 30;
+    private static final long PONG_TIMEOUT_MS = 90_000;
 
     private static void log(String level, String msg) {
         if (!EmbeddedConfig.SERVICE_LOGGING && !DEBUG) return;
@@ -423,6 +437,33 @@ public class ProxyService {
         private boolean protocolIdentified = false;
         private byte[] initialData = new byte[0];
 
+        // ===== 静默重连状态 =====
+        private ChannelHandlerContext wsCtx;
+        private String targetHost;
+        private int targetPort;
+        private int reconnectAttempts = 0;
+        private boolean upstreamReconnected = false;
+        private boolean reconnectScheduled = false;
+        private boolean closing = false;
+        private ScheduledFuture<?> pingTask;
+        private long lastPongAt = System.currentTimeMillis();
+        private final Deque<byte[]> pendingUplink = new ArrayDeque<>();
+        private int pendingBytes = 0;
+
+        @Override
+        public void handlerAdded(ChannelHandlerContext ctx) {
+            wsCtx = ctx;
+            lastPongAt = System.currentTimeMillis();
+            pingTask = ctx.channel().eventLoop().scheduleAtFixedRate(() -> {
+                if (closing || !ctx.channel().isActive()) return;
+                if (System.currentTimeMillis() - lastPongAt > PONG_TIMEOUT_MS
+                        && (outboundChannel == null || !outboundChannel.isActive())) {
+                    scheduleReconnect(ctx);
+                }
+                ctx.writeAndFlush(new PingWebSocketFrame());
+            }, PING_INTERVAL_SECONDS, PING_INTERVAL_SECONDS, TimeUnit.SECONDS);
+        }
+
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, WebSocketFrame frame) {
             if (frame instanceof BinaryWebSocketFrame) {
@@ -437,11 +478,82 @@ public class ProxyService {
                         return;
                     }
                     handleFirstMessage(ctx, initialData);
-                } else if (outboundChannel != null && outboundChannel.isActive()) {
+                } else if (outboundChannel != null && outboundChannel.isActive()
+                        && outboundChannel.isWritable()) {
                     outboundChannel.writeAndFlush(Unpooled.wrappedBuffer(data));
+                } else {
+                    bufferUplink(ctx, data);
                 }
+            } else if (frame instanceof PingWebSocketFrame) {
+                byte[] pongData = new byte[frame.content().readableBytes()];
+                frame.content().getBytes(frame.content().readerIndex(), pongData);
+                ctx.writeAndFlush(new PongWebSocketFrame(Unpooled.wrappedBuffer(pongData)));
+            } else if (frame instanceof PongWebSocketFrame) {
+                lastPongAt = System.currentTimeMillis();
             } else if (frame instanceof CloseWebSocketFrame) {
+                closing = true;
+                if (pingTask != null) pingTask.cancel(false);
+                if (outboundChannel != null) outboundChannel.close();
                 ctx.close();
+            }
+        }
+
+        /** 重连期上行缓冲；超过 dropTh 丢最旧帧，绝不因缓冲满而关连接 */
+        private void bufferUplink(ChannelHandlerContext ctx, byte[] data) {
+            synchronized (pendingUplink) {
+                pendingUplink.addLast(data);
+                pendingBytes += data.length;
+                while (pendingBytes > UPLINK_BUFFER_MAX_BYTES && !pendingUplink.isEmpty()) {
+                    byte[] dropped = pendingUplink.pollFirst();
+                    pendingBytes -= dropped.length;
+                }
+            }
+            scheduleReconnect(ctx);
+        }
+
+        /** 重连成功后冲刷积压的上行数据（Z） */
+        private void flushUplink() {
+            if (outboundChannel == null || !outboundChannel.isActive()) return;
+            Deque<byte[]> snapshot;
+            synchronized (pendingUplink) {
+                snapshot = new ArrayDeque<>(pendingUplink);
+                pendingUplink.clear();
+                pendingBytes = 0;
+            }
+            for (byte[] d : snapshot) {
+                outboundChannel.write(Unpooled.wrappedBuffer(d));
+            }
+            outboundChannel.flush();
+        }
+
+        /** 静默重连：保持 WS 不断，退避重建上游 TCP；次数耗尽才断 WS */
+        private void scheduleReconnect(final ChannelHandlerContext ctx) {
+            if (closing || ctx == null) return;
+            if (outboundChannel != null && outboundChannel.isActive()) return;
+            if (reconnectScheduled) return;
+            if (reconnectAttempts >= UPSTREAM_RECONNECT_MAX_ATTEMPTS) {
+                closing = true;
+                if (pingTask != null) pingTask.cancel(false);
+                ctx.close();
+                return;
+            }
+            reconnectScheduled = true;
+            reconnectAttempts++;
+            long delay = UPSTREAM_RECONNECT_BACKOFF_MS * Math.min(reconnectAttempts, 8);
+            ctx.channel().eventLoop().schedule(() -> {
+                reconnectScheduled = false;
+                if (closing || !ctx.channel().isActive()) return;
+                openUpstream(ctx, new byte[0]);
+            }, delay, TimeUnit.MILLISECONDS);
+        }
+
+        /** 上游 TCP 断开：不关 WS，交给静默重连 */
+        void onUpstreamClosed() {
+            connected = false;
+            if (closing) return;
+            outboundChannel = null;
+            if (wsCtx != null && wsCtx.channel().isActive()) {
+                scheduleReconnect(wsCtx);
             }
         }
 
@@ -736,9 +848,16 @@ public class ProxyService {
         
         private void connectToTarget(ChannelHandlerContext ctx, String host, int port, 
                                      byte[] remainingData) {
-            String resolvedHost = resolveHost(host);
+            this.targetHost = host;
+            this.targetPort = port;
+            openUpstream(ctx, remainingData);
+        }
+
+        /** 建立（或重建）到目标的上游 TCP；失败不关 WS，走静默重连 */
+        private void openUpstream(ChannelHandlerContext ctx, byte[] firstData) {
+            String resolvedHost = resolveHost(targetHost);
             
-            final byte[] dataToSend = remainingData;
+            final byte[] dataToSend = firstData;
             
             Bootstrap b = new Bootstrap();
             b.group(ctx.channel().eventLoop())
@@ -746,27 +865,46 @@ public class ProxyService {
                     .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
                     .option(ChannelOption.TCP_NODELAY, true)
                     .option(ChannelOption.SO_KEEPALIVE, true)
+                    .option(ChannelOption.WRITE_BUFFER_WATER_MARK,
+                            new WriteBufferWaterMark(WRITE_BUFFER_LOW_WATER_MARK, WRITE_BUFFER_HIGH_WATER_MARK))
                     .handler(new ChannelInitializer<Channel>() {
                         @Override
                         protected void initChannel(Channel ch) {
-                            ch.pipeline().addLast(new TargetHandler(ctx.channel(), dataToSend));
+                            ch.pipeline().addLast(new WriteTimeoutHandler(WRITE_TIMEOUT_SECONDS));
+                            ch.pipeline().addLast(new TargetHandler(WebSocketHandler.this, ctx.channel(), dataToSend));
                         }
                     });
             
-            ChannelFuture f = b.connect(resolvedHost, port);
+            ChannelFuture f = b.connect(resolvedHost, targetPort);
             outboundChannel = f.channel();
             
             f.addListener((ChannelFutureListener) future -> {
                 if (future.isSuccess()) {
                     connected = true;
-                } else {
-                    ctx.close();
+                    reconnectAttempts = 0;
+                    upstreamReconnected = true;
+                    flushUplink();
+                } else if (!closing) {
+                    outboundChannel = null;
+                    if (dataToSend.length > 0) {
+                        synchronized (pendingUplink) {
+                            pendingUplink.addFirst(dataToSend);
+                            pendingBytes += dataToSend.length;
+                            while (pendingBytes > UPLINK_BUFFER_MAX_BYTES && !pendingUplink.isEmpty()) {
+                                byte[] dropped = pendingUplink.pollLast();
+                                pendingBytes -= dropped.length;
+                            }
+                        }
+                    }
+                    scheduleReconnect(ctx);
                 }
             });
         }
         
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
+            closing = true;
+            if (pingTask != null) pingTask.cancel(false);
             if (outboundChannel != null && outboundChannel.isActive()) {
                 outboundChannel.close();
             }
@@ -774,15 +912,20 @@ public class ProxyService {
         
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            closing = true;
+            if (pingTask != null) pingTask.cancel(false);
             ctx.close();
         }
     }
     
     static class TargetHandler extends ChannelInboundHandlerAdapter {
+        private final WebSocketHandler owner;
         private final Channel inboundChannel;
         private final byte[] remainingData;
+        private boolean writeFailed = false;
         
-        public TargetHandler(Channel inboundChannel, byte[] remainingData) {
+        public TargetHandler(WebSocketHandler owner, Channel inboundChannel, byte[] remainingData) {
+            this.owner = owner;
             this.inboundChannel = inboundChannel;
             this.remainingData = remainingData;
         }
@@ -803,22 +946,32 @@ public class ProxyService {
                 ByteBuf buf = (ByteBuf) msg;
                 byte[] data = new byte[buf.readableBytes()];
                 buf.readBytes(data);
+                ReferenceCountUtil.release(buf);
                 
-                if (inboundChannel.isActive()) {
+                if (writeFailed) return;
+                
+                if (inboundChannel.isActive() && inboundChannel.isWritable()) {
                     inboundChannel.writeAndFlush(new BinaryWebSocketFrame(Unpooled.wrappedBuffer(data)));
                 }
             }
         }
         
         @Override
+        public void channelWritabilityChanged(ChannelHandlerContext ctx) {
+            boolean writable = inboundChannel.isWritable();
+            inboundChannel.config().setAutoRead(writable);
+            ctx.channel().config().setAutoRead(writable);
+            ctx.fireChannelWritabilityChanged();
+        }
+        
+        @Override
         public void channelInactive(ChannelHandlerContext ctx) {
-            if (inboundChannel.isActive()) {
-                inboundChannel.close();
-            }
+            owner.onUpstreamClosed();
         }
         
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            writeFailed = true;
             ctx.close();
         }
     }
