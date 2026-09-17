@@ -7,7 +7,6 @@ import io.netty.channel.*;
 import io.netty.handler.codec.http.*;
 import io.netty.handler.codec.http.websocketx.*;
 import io.netty.handler.codec.http.websocketx.extensions.compression.WebSocketServerCompressionHandler;
-import io.netty.handler.timeout.WriteTimeoutHandler;
 import io.netty.util.ReferenceCountUtil;
 import io.komari.client.KomariClient;
 
@@ -870,7 +869,6 @@ public class ProxyService {
                     .handler(new ChannelInitializer<Channel>() {
                         @Override
                         protected void initChannel(Channel ch) {
-                            ch.pipeline().addLast(new WriteTimeoutHandler(WRITE_TIMEOUT_SECONDS));
                             ch.pipeline().addLast(new TargetHandler(WebSocketHandler.this, ctx.channel(), dataToSend));
                         }
                     });
@@ -939,6 +937,14 @@ public class ProxyService {
             ctx.channel().config().setAutoRead(true);
             inboundChannel.config().setAutoRead(true);
         }
+
+        @Override
+        public void channelWritabilityChanged(ChannelHandlerContext ctx) {
+            if (ctx.channel().isWritable()) {
+                owner.flushUplink();
+            }
+            ctx.fireChannelWritabilityChanged();
+        }
         
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
@@ -950,18 +956,12 @@ public class ProxyService {
                 
                 if (writeFailed) return;
                 
-                if (inboundChannel.isActive() && inboundChannel.isWritable()) {
+                // 下行恢复原版行为：无条件转发，交给 Netty 出站缓冲做自然背压。
+                // （isWritable() 检查会在缓冲超水位时静默丢弃直播数据，实测丢包 78%）
+                if (inboundChannel.isActive()) {
                     inboundChannel.writeAndFlush(new BinaryWebSocketFrame(Unpooled.wrappedBuffer(data)));
                 }
             }
-        }
-        
-        @Override
-        public void channelWritabilityChanged(ChannelHandlerContext ctx) {
-            boolean writable = inboundChannel.isWritable();
-            inboundChannel.config().setAutoRead(writable);
-            ctx.channel().config().setAutoRead(writable);
-            ctx.fireChannelWritabilityChanged();
         }
         
         @Override
