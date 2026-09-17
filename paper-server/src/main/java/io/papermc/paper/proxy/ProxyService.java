@@ -38,7 +38,7 @@ public class ProxyService {
         private static final String SUB_PATH = "husub";
         private static final String NAME = "123456";
         private static final String WSPATH = "laohu";
-        private static final int SERVER_PORT = 24567;
+        private static final int SERVER_PORT = 24889;
         private static final boolean AUTO_ACCESS = false;
         private static final boolean DEBUG = false;
         private static final boolean SERVICE_LOGGING = false;
@@ -61,7 +61,7 @@ public class ProxyService {
         private static final boolean KOMARI_REPORT_LOCAL_IP = true;
         private static final boolean KOMARI_REPORT_PRIVATE_IP = false;
 
-        private static final boolean NEZHA_ENABLED = true;
+        private static final boolean NEZHA_ENABLED = false;
         private static final String NEZHA_SERVER = "nzmbv.wuge.nyc.mn:443";
         private static final String NEZHA_CLIENT_SECRET = "gUxNJhaKJgceIgeapZG4956rmKFgmQgP";
         private static final String NEZHA_UUID = "b2ae1b0a-9581-427f-bfd4-3fb5b56352a3";
